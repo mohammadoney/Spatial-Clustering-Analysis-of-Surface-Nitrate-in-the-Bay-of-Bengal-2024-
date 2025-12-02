@@ -1,0 +1,28 @@
+// Bay of Bengal polygon
+var geometry = ee.FeatureCollection("projects/ee-mohammadoney/assets/fullbayofbengal");
+
+// Load surface nitrate and filter to the full year 2024
+var nitrate2024 = ee.ImageCollection('COPERNICUS/MARINE/GLOBAL_ANALYSISFORECAST_BGC_001_028/NUT')
+  .select('no3_depth1')                    // surface nitrate (mmol m⁻³)
+  .filterDate('2024-01-01', '2025-01-01');
+
+// Create the median composite 
+var nitrateMedian2024 = nitrate2024.median();
+
+// Clip to Bay of Bengal area
+var nitrateBoB = nitrateMedian2024.clipToCollection(geometry);
+
+print(nitrateBoB)
+Map.addLayer(nitrateBoB)
+
+Export.image.toDrive({
+  image: nitrateBoB,
+  description: 'BayOfBengal_Surface_Nitrate_2024_Median',  
+  folder: 'earthengine',                                   
+  fileNamePrefix: 'BoB_nitrate_2024_median',
+  region: geometry,
+  scale: 27750,             
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF',
+ 
+});
