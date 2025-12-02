@@ -1,0 +1,246 @@
+# ===============================================
+#  FULL SPATIAL PATTERN + HOTSPOT ANALYSIS
+#  For: BoB_nitrate_2024_median.tif (single-year median composite)
+#  Output: Beautiful 4-panel figure (publishable quality)
+# ===============================================
+
+# Install required packages (run once)
+!pip install rasterio libpysal esda mapclassify contextily matplotlib_scalebar geopandas -q
+
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, BoundaryNorm
+import matplotlib.patches as mpatches
+import geopandas as gpd
+from libpysal.weights import Queen
+from esda.getisord import G_Local
+import warnings
+warnings.filterwarnings("ignore")
+
+# ================== 1. LOAD THE MEDIAN COMPOSITE ==================
+tiff_path = '/content/drive/MyDrive/earthengine/BoB_nitrate_2024_median.tif'
+
+with rasterio.open(tiff_path) as src:
+    nitrate = src.read(1).astype(np.float64)  # use float64 for accuracy
+    nodata = src.nodata
+    transform = src.transform
+    crs = src.crs
+    profile = src.profile
+
+# Mask NoData
+nitrate = np.where(nitrate == nodata, np.nan, nitrate)
+
+print(f"Loaded array shape: {nitrate.shape}")
+print(f"Nitrate range: {np.nanmin(nitrate):.3f} – {np.nanmax(nitrate):.3f} mmol m⁻³")
+
+# ================== 2. Prepare data for spatial analysis ==================
+values_raw = nitrate.copy()
+
+# ================== 3. Local Getis-Ord Gi* Hot/Cold Spot Analysis ==================
+print("Computing Local Getis-Ord Gi* (this may take 1–3 minutes for large rasters)...")
+
+# Create coordinates only for valid pixels (removes ocean/land mask automatically)
+rows, cols = np.indices(nitrate.shape)
+valid_mask = ~np.isnan(nitrate)
+valid_rows = rows[valid_mask]
+valid_cols = cols[valid_mask]
+valid_values = nitrate[valid_mask]
+
+# Create GeoDataFrame for spatial weights
+gdf = gpd.GeoDataFrame(
+    geometry=gpd.points_from_xy(valid_cols, valid_rows),
+    index=range(len(valid_rows))
+)
+
+# Build spatial weights (Queen contiguity = 8 neighbors)
+w = Queen.from_dataframe(gdf)
+
+# Run Local Getis-Ord Gi*
+g_local = G_Local(valid_values, w, star=True)  # star=True → includes center pixel (standard)
+
+# Create empty rasters for results
+gi_z = np.full(nitrate.shape, np.nan)
+gi_p = np.full(nitrate.shape, np.nan)
+
+# Put results back
+gi_z[valid_mask] = g_local.Zs
+gi_p[valid_mask] = g_local.p_sim  # simulated p-values (robust)
+
+print("Getis-Ord Gi* completed!")
+print(f"Z-scores range: {np.nanmin(gi_z):.3f} – {np.nanmax(gi_z):.3f}")
+print(f"P-values range: {np.nanmin(gi_p):.3f} – {np.nanmax(gi_p):.3f}")
+
+# ================== 4. Hotspot/Coldspot Classification (95% confidence) ==================
+hotspot_map = np.zeros_like(nitrate)
+hotspot_map[(gi_z > 1.96) & (gi_p < 0.05)] = 3   # 99% hot spot
+hotspot_map[(gi_z > 1.65) & (gi_z <= 1.96) & (gi_p < 0.05)] = 2  # 95% hot spot
+hotspot_map[(gi_z > 0) & (gi_z <= 1.65) & (gi_p < 0.05)] = 1     # 90% hot spot
+hotspot_map[(gi_z < -1.96) & (gi_p < 0.05)] = -3  # 99% cold spot
+hotspot_map[(gi_z < -1.65) & (gi_z >= -1.96) & (gi_p < 0.05)] = -2  # 95% cold spot
+hotspot_map[(gi_z < 0) & (gi_z >= -1.65) & (gi_p < 0.05)] = -1      # 90% cold spot
+
+# ================== 5. FOUR-PANEL GOLD STANDARD FIGURE ==================
+fig = plt.figure(figsize=(16, 12))
+gs = fig.add_gridspec(2, 2, hspace=0.15, wspace=0.15)
+
+# Custom colormap for nitrate (ocean-style)
+nitrate_colors = ["#f7fbff","#deebf7","#c6dbef","#9ecae1","#6baed6","#4292c6","#2171b5","#08519c","#08306b"]
+cmap_nitrate = LinearSegmentedColormap.from_list("nitrate", nitrate_colors)
+
+# Panel A: Raw median nitrate
+ax1 = fig.add_subplot(gs[0, 0])
+im1 = ax1.imshow(nitrate, cmap=cmap_nitrate, vmin=0, vmax=12)
+ax1.set_title('2024 Median Surface Nitrate (mmol m⁻³)', fontsize=10, pad=20)
+cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
+cbar1.set_label('Nitrate (mmol m⁻³)')
+ax1.axis('off')
+
+# Panel B: Only significant spatial clusters (p < 0.05 from Gi*)
+ax2 = fig.add_subplot(gs[0, 1])
+masked = np.ma.masked_where(gi_p >= 0.05, nitrate)
+im2 = ax2.imshow(masked, cmap=cmap_nitrate, vmin=0, vmax=12)
+ax2.set_title('Only Statistically Significant Pixels\n(Getis-Ord Gi* p < 0.05)', fontsize=10, pad=20)
+cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.8)
+cbar2.set_label('Nitrate (mmol m⁻³)')
+ax2.axis('off')
+
+# Panel C: Classic Hotspot/Coldspot Map
+ax3 = fig.add_subplot(gs[1, 0])
+colors_hotcold = ['#08519c','#4292c6','#9ecae1','lightgray','#fc9272','#de2d26','#a50f15']
+cmap_hotcold = LinearSegmentedColormap.from_list("hotcold", colors_hotcold, N=7)
+bounds = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
+norm = BoundaryNorm(bounds, cmap_hotcold.N)  # FIXED: Changed plt BoundaryNorm to BoundaryNorm
+
+im3 = ax3.imshow(hotspot_map, cmap=cmap_hotcold, norm=norm)
+ax3.set_title('Getis-Ord Gi* Hotspots & Coldspots of Nitrate', fontsize=10, pad=20)
+
+# Custom legend
+legend_labels = {
+    3: '99% Hotspot', 2: '95% Hotspot', 1: '90% Hotspot',
+    0: 'Not significant',
+    -1: '90% Coldspot', -2: '95% Coldspot', -3: '99% Coldspot'
+}
+patches = [mpatches.Patch(color=cmap_hotcold((v+3.5)/7), label=legend_labels.get(v, 'Not sig.'))
+           for v in [3,2,1,0,-1,-2,-3]]
+ax3.legend(handles=patches, loc='lower left', bbox_to_anchor=(0, -0.3), ncol=2, fontsize=11)
+ax3.axis('off')
+
+# Panel D: Beautiful diverging map with stippling on non-significant areas
+ax4 = fig.add_subplot(gs[1, 1])
+# Use standardized Z-scores for diverging look
+z_display = gi_z.copy()
+z_display[gi_p >= 0.05] = 0  # set non-sig to gray
+im4 = ax4.imshow(z_display, cmap='RdBu_r', vmin=-3, vmax=3)
+ax4.set_title('Gi* Z-scores\n(Stippled = not significant)', fontsize=10, pad=20)
+cbar4 = plt.colorbar(im4, ax=ax4, shrink=0.8)
+cbar4.set_label('Getis-Ord Gi* Z-score')
+
+# Add stippling (black dots) where p >= 0.05
+stipple = np.ma.masked_where(gi_p >= 0.05, np.ones_like(gi_p))
+ax4.imshow(stipple, cmap='gray', alpha=0.6, interpolation='none', vmin=0, vmax=1)
+ax4.axis('off')
+
+plt.suptitle('Spatial Pattern Analysis of 2024 Median Surface Nitrate – Bay of Bengal',
+             fontsize=18, y=0.95, weight='bold')
+plt.show()
+
+# ===============================================
+# STATISTICAL SUMMARY & INTERPRETATION
+# ===============================================
+
+print("\n" + "="*60)
+print("GETIS-ORD GI* STATISTICAL INTERPRETATION")
+print("="*60)
+
+# 1. Basic statistics
+total_pixels = np.sum(~np.isnan(nitrate))
+valid_gi_pixels = np.sum(~np.isnan(gi_p))
+print(f"\n1. BASIC STATISTICS:")
+print(f"   • Total valid nitrate pixels: {total_pixels:,}")
+print(f"   • Pixels with Gi* results: {valid_gi_pixels:,}")
+
+# 2. Significance levels
+sig_pixels = np.sum(gi_p < 0.05)
+sig_percentage = (sig_pixels / total_pixels) * 100
+print(f"\n2. OVERALL SIGNIFICANCE:")
+print(f"   • Significant pixels (p < 0.05): {sig_pixels:,} ({sig_percentage:.1f}%)")
+
+# 3. Hotspot classification counts
+print(f"\n3. HOTSPOT CLASSIFICATION:")
+print(f"   • 99% confidence hotspots (Z > 1.96): {np.sum(hotspot_map == 3):,}")
+print(f"   • 95% confidence hotspots (Z > 1.65): {np.sum(hotspot_map == 2):,}")
+print(f"   • 90% confidence hotspots (Z > 0):    {np.sum(hotspot_map == 1):,}")
+
+# 4. Coldspot classification counts
+print(f"\n4. COLDSPOT CLASSIFICATION:")
+print(f"   • 99% confidence coldspots (Z < -1.96): {np.sum(hotspot_map == -3):,}")
+print(f"   • 95% confidence coldspots (Z < -1.65): {np.sum(hotspot_map == -2):,}")
+print(f"   • 90% confidence coldspots (Z < 0):     {np.sum(hotspot_map == -1):,}")
+
+# 5. Not significant
+not_sig = np.sum(hotspot_map == 0)
+not_sig_percentage = (not_sig / total_pixels) * 100
+print(f"\n5. NOT SIGNIFICANT:")
+print(f"   • Pixels with no clustering: {not_sig:,} ({not_sig_percentage:.1f}%)")
+
+# 6. Z-score statistics
+print(f"\n6. Z-SCORE STATISTICS:")
+print(f"   • Minimum Z-score: {np.nanmin(gi_z):.3f}")
+print(f"   • Maximum Z-score: {np.nanmax(gi_z):.3f}")
+print(f"   • Mean |Z-score|:  {np.nanmean(np.abs(gi_z)):.3f}")
+print(f"   • Median Z-score:  {np.nanmedian(gi_z):.3f}")
+
+# 7. P-value statistics
+print(f"\n7. P-VALUE STATISTICS:")
+print(f"   • Minimum p-value: {np.nanmin(gi_p):.6f}")
+print(f"   • Maximum p-value: {np.nanmax(gi_p):.6f}")
+print(f"   • Median p-value:  {np.nanmedian(gi_p):.6f}")
+
+# 8. Nitrate values in different classes
+print(f"\n8. NITRATE CONCENTRATIONS BY CLASS:")
+for value, label in [(3, '99% Hotspots'), (2, '95% Hotspots'), (1, '90% Hotspots'),
+                     (-1, '90% Coldspots'), (-2, '95% Coldspots'), (-3, '99% Coldspots')]:
+    mask = hotspot_map == value
+    if np.any(mask):
+        nitrate_vals = nitrate[mask]
+        print(f"   • {label}: {np.nanmean(nitrate_vals):.2f} ± {np.nanstd(nitrate_vals):.2f} mmol m⁻³")
+
+# 9. Interpretation table
+print(f"\n" + "="*60)
+print("INTERPRETATION TABLE (Standard Normal Distribution)")
+print("="*60)
+print(f"{'Z-score Range':<20} {'p < 0.05':<15} {'Interpretation':<40}")
+print("-"*75)
+interpretations = [
+    ("Z > 2.58", "Yes", "99% confidence hotspot"),
+    ("Z > 1.96", "Yes", "95% confidence hotspot"),
+    ("Z > 1.65", "Yes", "90% confidence hotspot"),
+    ("-1.65 < Z < 1.65", "No", "Not significant"),
+    ("Z < -1.65", "Yes", "90% confidence coldspot"),
+    ("Z < -1.96", "Yes", "95% confidence coldspot"),
+    ("Z < -2.58", "Yes", "99% confidence coldspot"),
+]
+
+for z_range, sig, interp in interpretations:
+    print(f"{z_range:<20} {sig:<15} {interp:<40}")
+
+# 10. Summary 
+print(f"\n" + "="*60)
+print("SUMMARY FOR MANUSCRIPT")
+print("="*60)
+total_hotspots = np.sum(hotspot_map > 0)
+total_coldspots = np.sum(hotspot_map < 0)
+total_clusters = total_hotspots + total_coldspots
+
+print(f"• {sig_percentage:.1f}% of the Bay of Bengal showed statistically")
+print(f"  significant spatial clustering (Getis-Ord Gi*, p < 0.05)")
+print(f"• Identified {total_clusters:,} clustered pixels:")
+print(f"  - {total_hotspots:,} hotspots (clusters of high nitrate)")
+print(f"  - {total_coldspots:,} coldspots (clusters of low nitrate)")
+print(f"• The strongest hotspots (99% confidence) had nitrate concentrations")
+print(f"  averaging {np.nanmean(nitrate[hotspot_map == 3]):.2f} mmol m⁻³")
+
+print("\n" + "="*60)
+print("STATISTICAL INTERPRETATION COMPLETE")
+print("="*60)
